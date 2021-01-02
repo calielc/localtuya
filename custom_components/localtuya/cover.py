@@ -33,7 +33,8 @@ COVER_FZZZ_CMDS = "fz_zz_stop"
 COVER_12_CMDS = "1_2_3"
 COVER_MODE_NONE = "none"
 COVER_MODE_POSITION = "position"
-COVER_MODE_FAKE = "fake"
+COVER_MODE_TIMED = "timed"
+COVER_TIMEOUT_TOLERANCE = 3.0
 
 DEFAULT_COMMANDS_SET = COVER_ONOFF_CMDS
 DEFAULT_POSITIONING_MODE = COVER_MODE_NONE
@@ -47,7 +48,7 @@ def flow_schema(dps):
             [COVER_ONOFF_CMDS, COVER_OPENCLOSE_CMDS, COVER_FZZZ_CMDS, COVER_12_CMDS]
         ),
         vol.Optional(CONF_POSITIONING_MODE, default=DEFAULT_POSITIONING_MODE): vol.In(
-            [COVER_MODE_NONE, COVER_MODE_POSITION, COVER_MODE_FAKE]
+            [COVER_MODE_NONE, COVER_MODE_POSITION, COVER_MODE_TIMED]
         ),
         vol.Optional(CONF_CURRENT_POSITION_DP): vol.In(dps),
         vol.Optional(CONF_SET_POSITION_DP): vol.In(dps),
@@ -64,17 +65,16 @@ class LocaltuyaCover(LocalTuyaEntity, CoverEntity):
     def __init__(self, device, config_entry, switchid, **kwargs):
         """Initialize a new LocaltuyaCover."""
         super().__init__(device, config_entry, switchid, _LOGGER, **kwargs)
-        self._state = None
-        self._current_cover_position = None
         commands_set = DEFAULT_COMMANDS_SET
         if self.has_config(CONF_COMMANDS_SET):
             commands_set = self._config[CONF_COMMANDS_SET]
         self._open_cmd = commands_set.split("_")[0]
         self._close_cmd = commands_set.split("_")[1]
         self._stop_cmd = commands_set.split("_")[2]
-        self._timer_start = None
-        self._previous_state = None
+        self._timer_start = time.time()
         self._state = self._stop_cmd
+        self._previous_state = self._state
+        self._current_cover_position = None
         print("Initialized cover [{}]".format(self.name))
         self.debug("initializing: %s", self._current_cover_position, self._state)
 
@@ -128,7 +128,7 @@ class LocaltuyaCover(LocalTuyaEntity, CoverEntity):
     async def async_set_cover_position(self, **kwargs):
         """Move the cover to a specific position."""
         self.debug("Setting cover position: %r", kwargs[ATTR_POSITION])
-        if self._config[CONF_POSITIONING_MODE] == COVER_MODE_FAKE:
+        if self._config[CONF_POSITIONING_MODE] == COVER_MODE_TIMED:
             newpos = float(kwargs[ATTR_POSITION])
             spantime = self._config[CONF_SPAN_TIME]
 
@@ -166,8 +166,7 @@ class LocaltuyaCover(LocalTuyaEntity, CoverEntity):
                     newpos, distance, mydelay
                 )
                 await self.async_close_cover()
-            await asyncio.sleep(mydelay)
-            await self.async_stop_cover()
+            self.hass.async_create_task(self.async_stop_after_timeout(mydelay))
             self.debug("Done")
 
         elif self._config[CONF_POSITIONING_MODE] == COVER_MODE_POSITION:
@@ -180,20 +179,49 @@ class LocaltuyaCover(LocalTuyaEntity, CoverEntity):
                     converted_position, self._config[CONF_SET_POSITION_DP]
                 )
 
+    async def async_stop_after_timeout(self, delay_sec):
+        """Stop the cover if timeout (max movement span) occurred."""
+        await asyncio.sleep(delay_sec)
+        await self.async_stop_cover()
+
     async def async_open_cover(self, **kwargs):
         """Open the cover."""
         self.debug("Launching command %s to cover ", self._open_cmd)
         await self._device.set_dp(self._open_cmd, self._dp_id)
+        if self._config[CONF_POSITIONING_MODE] == COVER_MODE_TIMED:
+            # for timed positioning, stop the cover after a full opening timespan
+            # instead of waiting the internal timeout
+            self.hass.async_create_task(
+                self.async_stop_after_timeout(
+                    self._config[CONF_SPAN_TIME] + COVER_TIMEOUT_TOLERANCE
+                )
+            )
 
     async def async_close_cover(self, **kwargs):
         """Close cover."""
         self.debug("Launching command %s to cover ", self._close_cmd)
         await self._device.set_dp(self._close_cmd, self._dp_id)
+        if self._config[CONF_POSITIONING_MODE] == COVER_MODE_TIMED:
+            # for timed positioning, stop the cover after a full opening timespan
+            # instead of waiting the internal timeout
+            self.hass.async_create_task(
+                self.async_stop_after_timeout(
+                    self._config[CONF_SPAN_TIME] + COVER_TIMEOUT_TOLERANCE
+                )
+            )
 
     async def async_stop_cover(self, **kwargs):
         """Stop the cover."""
         self.debug("Launching command %s to cover ", self._stop_cmd)
         await self._device.set_dp(self._stop_cmd, self._dp_id)
+
+    def status_restored(self, stored_state):
+        """Restore the last stored cover status."""
+        if self._config[CONF_POSITIONING_MODE] == COVER_MODE_TIMED:
+            stored_pos = stored_state.attributes.get("current_position")
+            if stored_pos is not None:
+                self._current_cover_position = stored_pos
+                self.debug("Restored cover position %s", self._current_cover_position)
 
     def status_updated(self):
         """Device status was updated."""
@@ -211,7 +239,7 @@ class LocaltuyaCover(LocalTuyaEntity, CoverEntity):
             else:
                 self._current_cover_position = curr_pos
         if (
-            self._config[CONF_POSITIONING_MODE] == COVER_MODE_FAKE
+            self._config[CONF_POSITIONING_MODE] == COVER_MODE_TIMED
             and self._state != self._previous_state
         ):
             if self._previous_state != self._stop_cmd:
@@ -237,6 +265,7 @@ class LocaltuyaCover(LocalTuyaEntity, CoverEntity):
                     time_diff,
                     pos_diff,
                 )
+
             # store the time of the last movement change
             self._timer_start = time.time()
 
