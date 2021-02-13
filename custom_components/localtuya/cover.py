@@ -74,8 +74,9 @@ class LocaltuyaCover(LocalTuyaEntity, CoverEntity):
         self._timer_start = time.time()
         self._state = self._stop_cmd
         self._previous_state = self._state
-        self._current_cover_position = 0
+        self._current_cover_position = None
         print("Initialized cover [{}]".format(self.name))
+        self.debug("initializing: %s", self._current_cover_position, self._state)
 
     @property
     def supported_features(self):
@@ -107,15 +108,21 @@ class LocaltuyaCover(LocalTuyaEntity, CoverEntity):
     @property
     def is_open(self):
         """Return if the cover is open or not."""
-        if self._config[CONF_POSITIONING_MODE] != COVER_MODE_POSITION:
+        if self._config[CONF_POSITIONING_MODE] == COVER_MODE_NONE:
             return None
 
-        return self._current_cover_position == 100
+        elif self._current_cover_position is None:
+            return None
+
+        return self._current_cover_position > 0
 
     @property
     def is_closed(self):
         """Return if the cover is closed or not."""
-        if self._config[CONF_POSITIONING_MODE] != COVER_MODE_POSITION:
+        if self._config[CONF_POSITIONING_MODE] == COVER_MODE_NONE:
+            return None
+
+        elif self._current_cover_position is None:
             return None
 
         return self._current_cover_position == 0
@@ -125,15 +132,41 @@ class LocaltuyaCover(LocalTuyaEntity, CoverEntity):
         self.debug("Setting cover position: %r", kwargs[ATTR_POSITION])
         if self._config[CONF_POSITIONING_MODE] == COVER_MODE_TIMED:
             newpos = float(kwargs[ATTR_POSITION])
+            spantime = self._config[CONF_SPAN_TIME]
 
             currpos = self.current_cover_position
-            posdiff = abs(newpos - currpos)
-            mydelay = posdiff / 100.0 * self._config[CONF_SPAN_TIME]
-            if newpos > currpos:
-                self.debug("Opening to %f: delay %f", newpos, mydelay)
-                await self.async_open_cover()
+            if currpos is None:
+                self.debug("Fully close to ensure position. Delay: %f", spantime)
+                await self.async_close_cover()
+                await asyncio.sleep(spantime)
+                await self.async_stop_cover()
+                await asyncio.sleep(1)
+                currpos = self._current_cover_position = 0
+
+            distance = 0
+            mydelay = spantime
+            if newpos < 5:
+                distance = -100
+            elif newpos > 95:
+                distance = +100
             else:
-                self.debug("Closing to %f: delay %f", newpos, mydelay)
+                distance = newpos - currpos
+                mydelay = abs(distance * spantime / 100.0)
+
+            if distance == 0:
+                self.debug("No moviment")
+                return
+            elif distance > 0:
+                self.debug(
+                    "Opening to %f - distance %f - delay %f",
+                    newpos, distance, mydelay
+                )
+                await self.async_open_cover()
+            elif distance < 0:
+                self.debug(
+                    "Closing to %f - distance %f - delay %f",
+                    newpos, distance, mydelay
+                )
                 await self.async_close_cover()
             self.hass.async_create_task(self.async_stop_after_timeout(mydelay))
             self.debug("Done")
@@ -217,9 +250,15 @@ class LocaltuyaCover(LocalTuyaEntity, CoverEntity):
                 pos_diff = round(time_diff / self._config[CONF_SPAN_TIME] * 100.0)
                 if self._previous_state == self._close_cmd:
                     pos_diff = -pos_diff
-                self._current_cover_position = min(
-                    100, max(0, self._current_cover_position + pos_diff)
-                )
+
+                if pos_diff >= 100:
+                    self._current_cover_position = 100
+                elif pos_diff <= -100:
+                    self._current_cover_position = 0
+                elif self._current_cover_position is not None:
+                    self._current_cover_position = min(
+                        100, max(0, self._current_cover_position + pos_diff)
+                    )
 
                 change = "stopped" if self._state == self._stop_cmd else "inverted"
                 self.debug(
